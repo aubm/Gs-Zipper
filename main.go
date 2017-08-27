@@ -2,73 +2,72 @@ package main
 
 import (
 	"archive/zip"
-	"flag"
 	"fmt"
 	"io"
 	"log"
+	"net/http"
 	"os"
 	"regexp"
 
 	"cloud.google.com/go/storage"
-	"golang.org/x/net/context"
 	"google.golang.org/api/iterator"
 )
 
 var targetRegexp = regexp.MustCompile(`gs:\/\/([^\/]+)/(.*)`)
 
 func main() {
-	opt := parseOptions()
-	ctx := context.Background()
+	http.HandleFunc("/", func(w http.ResponseWriter, r *http.Request) {
+		opt := parseOptions(r)
+		ctx := r.Context()
 
-	client, err := storage.NewClient(ctx)
-	if err != nil {
-		exitWithError(err)
-	}
-
-	outputZipFile, err := os.Create("output.zip")
-	if err != nil {
-		exitWithError(err)
-	}
-	defer outputZipFile.Close()
-
-	zipWriter := zip.NewWriter(outputZipFile)
-	defer zipWriter.Close()
-
-	bucket := client.Bucket(opt.BucketName)
-	it := bucket.Objects(ctx, &storage.Query{Prefix: opt.PathPrefix})
-	for {
-		obj, err := it.Next()
+		client, err := storage.NewClient(ctx)
 		if err != nil {
-			if err == iterator.Done {
-				return
+			http.Error(w, err.Error(), http.StatusInternalServerError)
+		}
+
+		w.Header().Set("Content-Type", "application/zip")
+		w.Header().Set("Content-Disposition", fmt.Sprintf("attachment; filename=\"%s\"", fmt.Sprintf("%s.zip", opt.PathPrefix)))
+
+		zipWriter := zip.NewWriter(w)
+		defer zipWriter.Close()
+
+		bucket := client.Bucket(opt.BucketName)
+		it := bucket.Objects(ctx, &storage.Query{Prefix: opt.PathPrefix})
+		for {
+			obj, err := it.Next()
+			if err != nil {
+				if err == iterator.Done {
+					return
+				}
+				http.Error(w, err.Error(), http.StatusInternalServerError)
 			}
-			exitWithError(err)
+
+			log.Printf("handling file %v", obj.Name)
+
+			r, err := bucket.Object(obj.Name).NewReader(ctx)
+			if err != nil {
+				http.Error(w, err.Error(), http.StatusInternalServerError)
+			}
+
+			wr, err := zipWriter.Create(obj.Name)
+			if err != nil {
+				http.Error(w, err.Error(), http.StatusInternalServerError)
+			}
+
+			if _, err := io.Copy(wr, r); err != nil {
+				http.Error(w, err.Error(), http.StatusInternalServerError)
+			}
+
+			log.Printf("done handling file: %v", obj.Name)
 		}
+	})
 
-		log.Printf("handling file %v", obj.Name)
-
-		r, err := bucket.Object(obj.Name).NewReader(ctx)
-		if err != nil {
-			exitWithError(err)
-		}
-
-		w, err := zipWriter.Create(obj.Name)
-		if err != nil {
-			exitWithError(err)
-		}
-
-		if _, err := io.Copy(w, r); err != nil {
-			exitWithError(err)
-		}
-
-		log.Printf("done handling file: %v", obj.Name)
-	}
-
+	fmt.Println("server started on port 8080")
+	log.Fatal(http.ListenAndServe(":8080", nil))
 }
 
-func parseOptions() (opt Options) {
-	flag.Parse()
-	if opt.Target = flag.Arg(0); opt.Target != "" {
+func parseOptions(r *http.Request) (opt Options) {
+	if opt.Target = r.URL.Query().Get("uri"); opt.Target != "" {
 		matches := targetRegexp.FindStringSubmatch(opt.Target)
 		if len(matches) == 3 {
 			opt.BucketName = matches[1]
